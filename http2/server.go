@@ -1723,6 +1723,36 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders) erro
 	return nil
 }
 
+// TODO there's a refactoring opportunity with func (sc *serverConn) processHeaders()
+func (sc *serverConn) newStream() uint32 {
+	// Get next even stream id, this feels clunky
+	id := sc.maxStreamID + 1 + (sc.maxStreamID+1)&1
+
+	if _, ok := sc.streams[id]; ok {
+		panic("didn't expect stream to be available")
+	}
+
+	sc.maxStreamID = id
+	st := &stream{sc: sc, id: id, state: stateOpen}
+	st.cw.Init()
+
+	// haven't looked into what these are actually for
+	st.flow.conn = &sc.flow // link to conn-level counter
+	st.flow.add(sc.initialWindowSize)
+	st.inflow.conn = &sc.inflow      // link to conn-level counter
+	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
+
+	sc.streams[id] = st
+
+	sc.curOpenStreams++
+	if sc.curOpenStreams == 1 {
+		sc.setConnState(http.StateActive)
+	}
+
+	// TODO check if we've exceeded sc.advMaxStreams
+	return id
+}
+
 // called from handler goroutines.
 func (sc *serverConn) write100ContinueHeaders(st *stream) {
 	sc.writeFrameFromHandler(frameWriteMsg{
@@ -1939,6 +1969,13 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			foreachHeaderElement(v, rws.declareTrailer)
 		}
 
+		if !isHeadResp && rws.conn.pushEnabled {
+			for _, v := range rws.snapHeader["Link"] {
+				// Ignore errors, as promise is opportunistic
+				_ = rws.conn.writePromise(rws.stream, rws.req.Host, v)
+			}
+		}
+
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:      rws.stream.id,
@@ -1985,6 +2022,66 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		return len(p), err
 	}
 	return len(p), nil
+}
+
+// TODO: writePromise modifies serverConn state this violates ownership and needs to be reconsidered but I couldn't demonstrate it producing a bug (yet)
+// it likely needs to be refactored to include a unbuffered writePromiseCh accepting a writePromiseMsg, but initial attempts deadlocked
+func (sc *serverConn) writePromise(st *stream, authority, promised string) error {
+	// Create a new stream for the pushed resource to be sent on
+	promiseID := sc.newStream()
+
+	// Create request header
+
+	// TODO are these fields using the compression optimally?
+	var frag bytes.Buffer
+	enc := hpack.NewEncoder(&frag)
+	encKV(enc, ":method", "GET")
+	encKV(enc, ":scheme", "https")
+	encKV(enc, ":authority", authority)
+	encKV(enc, ":path", promised)
+
+	sc.streams[promiseID].state = stateResvLocal
+	err := sc.writeFrameFromHandler(frameWriteMsg{
+		write: writePromise{
+			streamID:      st.id,
+			promiseID:     promiseID,
+			blockFragment: frag.Bytes(),
+			endHeaders:    true,
+		},
+		stream: st,
+	})
+	if err != nil {
+		sc.closeStream(sc.streams[promiseID], err)
+		return err
+	}
+
+	// Build framed request
+	mh := &MetaHeadersFrame{
+		HeadersFrame: &HeadersFrame{
+			FrameHeader: FrameHeader{
+				Type:     FrameHeaders,
+				Flags:    FlagHeadersEndHeaders,
+				Length:   1, // TODO
+				StreamID: promiseID,
+			},
+		},
+		Fields: []hpack.HeaderField{
+			{Name: ":method", Value: "GET"},
+			{Name: ":scheme", Value: "https"},
+			{Name: ":authority", Value: authority},
+			{Name: ":path", Value: promised},
+			{Name: "h2push", Value: "true"}, // add header for demo applications
+		},
+	}
+
+	// Execute push resources http.handler
+	rw, req, err := sc.newWriterAndRequest(sc.streams[promiseID], mh)
+	if err != nil {
+		return err
+	}
+	go sc.runHandler(rw, req, sc.handler.ServeHTTP)
+
+	return nil
 }
 
 // TrailerPrefix is a magic prefix for ResponseWriter.Header map keys

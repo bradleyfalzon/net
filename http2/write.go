@@ -82,6 +82,22 @@ func (p *writeGoAway) writeFrame(ctx writeContext) error {
 	return err
 }
 
+type writePromise struct {
+	streamID      uint32
+	promiseID     uint32
+	blockFragment []byte
+	endHeaders    bool
+}
+
+func (w writePromise) writeFrame(ctx writeContext) error {
+	return ctx.Framer().WritePushPromise(PushPromiseParam{
+		StreamID:      w.streamID,
+		PromiseID:     w.promiseID,
+		BlockFragment: w.blockFragment,
+		EndHeaders:    w.endHeaders,
+	})
+}
+
 type writeData struct {
 	streamID  uint32
 	p         []byte
