@@ -1724,7 +1724,7 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders) erro
 }
 
 // TODO there's a refactoring opportunity with func (sc *serverConn) processHeaders()
-func (sc *serverConn) newStream() uint32 {
+func (sc *serverConn) newStream() *stream {
 	// Get next even stream id, this feels clunky
 	id := sc.maxStreamID + 1 + (sc.maxStreamID+1)&1
 
@@ -1750,7 +1750,7 @@ func (sc *serverConn) newStream() uint32 {
 	}
 
 	// TODO check if we've exceeded sc.advMaxStreams
-	return id
+	return st
 }
 
 // called from handler goroutines.
@@ -1972,7 +1972,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		if !isHeadResp && rws.conn.pushEnabled {
 			for _, v := range rws.snapHeader["Link"] {
 				// Ignore errors, as promise is opportunistic
-				_ = rws.conn.writePromise(rws.stream, rws.req.Host, v)
+				_ = rws.writePromise(v)
 			}
 		}
 
@@ -2026,9 +2026,9 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 
 // TODO: writePromise modifies serverConn state this violates ownership and needs to be reconsidered but I couldn't demonstrate it producing a bug (yet)
 // it likely needs to be refactored to include a unbuffered writePromiseCh accepting a writePromiseMsg, but initial attempts deadlocked
-func (sc *serverConn) writePromise(st *stream, authority, promised string) error {
+func (rws *responseWriterState) writePromise(promised string) error {
 	// Create a new stream for the pushed resource to be sent on
-	promiseID := sc.newStream()
+	pstream := rws.conn.newStream()
 
 	// Create request header
 
@@ -2037,21 +2037,21 @@ func (sc *serverConn) writePromise(st *stream, authority, promised string) error
 	enc := hpack.NewEncoder(&frag)
 	encKV(enc, ":method", "GET")
 	encKV(enc, ":scheme", "https")
-	encKV(enc, ":authority", authority)
+	encKV(enc, ":authority", rws.req.Host)
 	encKV(enc, ":path", promised)
 
-	sc.streams[promiseID].state = stateResvLocal
-	err := sc.writeFrameFromHandler(frameWriteMsg{
+	pstream.state = stateResvLocal
+	err := rws.conn.writeFrameFromHandler(frameWriteMsg{
 		write: writePromise{
-			streamID:      st.id,
-			promiseID:     promiseID,
+			streamID:      rws.stream.id,
+			promiseID:     pstream.id,
 			blockFragment: frag.Bytes(),
 			endHeaders:    true,
 		},
-		stream: st,
+		stream: rws.stream,
 	})
 	if err != nil {
-		sc.closeStream(sc.streams[promiseID], err)
+		rws.conn.closeStream(pstream, err)
 		return err
 	}
 
@@ -2062,24 +2062,24 @@ func (sc *serverConn) writePromise(st *stream, authority, promised string) error
 				Type:     FrameHeaders,
 				Flags:    FlagHeadersEndHeaders,
 				Length:   1, // TODO
-				StreamID: promiseID,
+				StreamID: pstream.id,
 			},
 		},
 		Fields: []hpack.HeaderField{
 			{Name: ":method", Value: "GET"},
 			{Name: ":scheme", Value: "https"},
-			{Name: ":authority", Value: authority},
+			{Name: ":authority", Value: rws.req.Host},
 			{Name: ":path", Value: promised},
 			{Name: "h2push", Value: "true"}, // add header for demo applications
 		},
 	}
 
 	// Execute push resources http.handler
-	rw, req, err := sc.newWriterAndRequest(sc.streams[promiseID], mh)
+	rw, req, err := rws.conn.newWriterAndRequest(pstream, mh)
 	if err != nil {
 		return err
 	}
-	go sc.runHandler(rw, req, sc.handler.ServeHTTP)
+	go rws.conn.runHandler(rw, req, rws.conn.handler.ServeHTTP)
 
 	return nil
 }
