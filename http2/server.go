@@ -2034,19 +2034,18 @@ func (rws *responseWriterState) writePromise(promised string) error {
 	// Create request header
 
 	// TODO are these fields using the compression optimally?
-	var frag bytes.Buffer
-	enc := hpack.NewEncoder(&frag)
-	encKV(enc, ":method", "GET")
-	encKV(enc, ":scheme", "https")
-	encKV(enc, ":authority", rws.req.Host)
-	encKV(enc, ":path", promised)
+	rws.conn.headerWriteBuf.Reset()
+	encKV(rws.conn.hpackEncoder, ":method", "GET")
+	encKV(rws.conn.hpackEncoder, ":scheme", "https")
+	encKV(rws.conn.hpackEncoder, ":authority", rws.req.Host)
+	encKV(rws.conn.hpackEncoder, ":path", promised)
 
 	pstream.state = stateResvLocal
 	err := rws.conn.writeFrameFromHandler(frameWriteMsg{
 		write: writePromise{
 			streamID:      rws.stream.id,
 			promiseID:     pstream.id,
-			blockFragment: frag.Bytes(),
+			blockFragment: rws.conn.headerWriteBuf.Bytes(),
 			endHeaders:    true,
 		},
 		stream: rws.stream,
