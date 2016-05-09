@@ -395,6 +395,7 @@ type serverConn struct {
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curOpenStreams        uint32 // client's number of open streams
 	maxStreamID           uint32 // max ever seen
+	serveMaxStreamID      uint32 // max promised
 	streams               map[uint32]*stream
 	initialWindowSize     int32
 	headerTableSize       uint32
@@ -1726,13 +1727,13 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders) erro
 // TODO there's a refactoring opportunity with func (sc *serverConn) processHeaders()
 func (sc *serverConn) newStream() *stream {
 	// Get next even stream id, this feels clunky
-	id := sc.maxStreamID + 1 + (sc.maxStreamID+1)&1
+	id := sc.serveMaxStreamID + 2
 
 	if _, ok := sc.streams[id]; ok {
 		panic("didn't expect stream to be available")
 	}
 
-	sc.maxStreamID = id
+	sc.serveMaxStreamID = id
 	st := &stream{sc: sc, id: id, state: stateOpen}
 	st.cw.Init()
 
@@ -2079,7 +2080,7 @@ func (rws *responseWriterState) writePromise(promised string) error {
 	if err != nil {
 		return err
 	}
-	go rws.conn.runHandler(rw, req, rws.conn.handler.ServeHTTP)
+	rws.conn.runHandler(rw, req, rws.conn.handler.ServeHTTP)
 
 	return nil
 }
