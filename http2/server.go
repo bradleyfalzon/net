@@ -1940,6 +1940,9 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		rws.writeHeader(200)
 	}
 
+	// Promised resources to be sent, TODO unlikely this is best method
+	var promisedHandlers []func()
+
 	isHeadResp := rws.req.Method == "HEAD"
 	if !rws.sentHeader {
 		rws.sentHeader = true
@@ -1972,8 +1975,13 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 
 		if !isHeadResp && rws.conn.pushEnabled {
 			for _, v := range rws.snapHeader["Link"] {
-				// Ignore errors, as promise is opportunistic
-				_ = rws.writePromise(v)
+				h, err := rws.sendPromise(v)
+				if err == nil {
+					promisedHandlers = append(promisedHandlers, h)
+
+				} else {
+					rws.conn.vlogf("http2: send promise %v: %v", v, err)
+				}
 			}
 		}
 
@@ -2022,20 +2030,36 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		})
 		return len(p), err
 	}
+
+	rws.conn.vlogf("http2: funcs to run: %v", len(promisedHandlers))
+
+	// We've waited until the response is ready before sending pushed data
+	// ideally we'd always push data, and as soon as response data was ready
+	// we'd transmit that, then continue sending any remaining pushed data.
+	// For the moment, just always wait until the original response data is
+	// finished sending before pushing, but there is an optimisation here.
+	for _, handler := range promisedHandlers {
+		rws.conn.vlogf("http2: running promised handler")
+		// TODO run in parallel?
+		handler()
+	}
+
 	return len(p), nil
 }
 
-// TODO: writePromise modifies serverConn state this violates ownership and needs to be reconsidered but I couldn't demonstrate it producing a bug (yet)
-// it likely needs to be refactored to include a unbuffered writePromiseCh accepting a writePromiseMsg, but initial attempts deadlocked
-func (rws *responseWriterState) writePromise(promised string) error {
+// sendPromise sends a PROMISE frame referencing a newly created stream that
+// will later be used to push responses
+func (rws *responseWriterState) sendPromise(promised string) (func(), error) {
 	// Create a new stream for the pushed resource to be sent on
 	pstream := rws.conn.newStream()
+
+	rws.conn.vlogf("http2: sending promise for %v on streamID %v", promised, pstream.id)
 
 	// Create request header
 
 	// TODO are these fields using the compression optimally?
 	rws.conn.headerWriteBuf.Reset()
-	encKV(rws.conn.hpackEncoder, ":method", "GET")
+	encKV(rws.conn.hpackEncoder, ":method", rws.req.Method)
 	encKV(rws.conn.hpackEncoder, ":scheme", "https")
 	encKV(rws.conn.hpackEncoder, ":authority", rws.req.Host)
 	encKV(rws.conn.hpackEncoder, ":path", promised)
@@ -2051,8 +2075,9 @@ func (rws *responseWriterState) writePromise(promised string) error {
 		stream: rws.stream,
 	})
 	if err != nil {
+		rws.conn.vlogf("http2: sending promise failed, closing stream: %v", err)
 		rws.conn.closeStream(pstream, err)
-		return err
+		return nil, err
 	}
 
 	// Build framed request
@@ -2064,6 +2089,7 @@ func (rws *responseWriterState) writePromise(promised string) error {
 				Length:   1, // TODO
 				StreamID: pstream.id,
 			},
+			//headerFragBuf: frag.Bytes(),
 		},
 		Fields: []hpack.HeaderField{
 			{Name: ":method", Value: "GET"},
@@ -2077,11 +2103,12 @@ func (rws *responseWriterState) writePromise(promised string) error {
 	// Execute push resources http.handler
 	rw, req, err := rws.conn.newWriterAndRequest(pstream, mh)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	rws.conn.runHandler(rw, req, rws.conn.handler.ServeHTTP)
 
-	return nil
+	return func() {
+		rws.conn.runHandler(rw, req, rws.conn.handler.ServeHTTP)
+	}, nil
 }
 
 // TrailerPrefix is a magic prefix for ResponseWriter.Header map keys
