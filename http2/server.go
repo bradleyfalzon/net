@@ -1972,9 +1972,16 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 
 		if !isHeadResp && rws.conn.pushEnabled {
 			for _, v := range rws.snapHeader["Link"] {
-				// Ignore errors, as promise is opportunistic
-				_ = rws.writePromise(v)
+				if !strings.Contains(v, "rel=preload") || strings.Contains(v, "nopush") {
+					continue
+				}
+				if url := strings.Split(v[1:], ">"); len(url) > 0 {
+					// Ignore errors, as promise is opportunistic
+					_ = rws.writePromise(url[0])
+				}
 			}
+			// TODO only remove headers we've actually pushed
+			rws.snapHeader.Del("Link")
 		}
 
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
